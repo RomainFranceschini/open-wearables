@@ -1,0 +1,153 @@
+# Dokploy-ready full stack — based on the repo's docker-compose.prod.yml
+# Changes vs upstream are marked with #CHANGED / #ADDED / #REMOVED.
+# - env_file now points at Dokploy's managed .env (next to this file) instead of
+#   ./backend/config/.env, which is gitignored and never present after clone.
+# - container_name removed everywhere (Dokploy advises against it: breaks logs/metrics).
+# - host port publishing removed for db/redis (avoids "port already allocated" on the host).
+#   app / frontend / flower use `expose` and are routed via Dokploy Domains (Traefik).
+# - db gets an init script that creates the `svix` database svix-server needs.
+
+services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_DB: open-wearables
+      POSTGRES_USER: open-wearables
+      POSTGRES_PASSWORD: open-wearables
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U open-wearables -d open-wearables"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    restart: unless-stopped
+    # ports removed — not needed on the host, and 5432 likely conflicts.   #REMOVED
+
+  app:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    image: open-wearables-platform:latest
+    pull_policy: never
+    command: scripts/start/app.sh
+    env_file:
+      - .env                       #CHANGED (was ./backend/config/.env)
+    environment:
+      - DB_HOST=db
+      - REDIS_HOST=redis
+    expose:
+      - "8000"                     #CHANGED (was ports: 8000:8000 — Traefik routes this)
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    restart: unless-stopped
+
+  celery-worker:
+    image: open-wearables-platform:latest
+    pull_policy: never
+    command: scripts/start/worker.sh
+    env_file:
+      - .env                       #CHANGED
+    environment:
+      - DB_HOST=db
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
+      - db
+      - app
+    restart: unless-stopped
+
+  celery-beat:
+    image: open-wearables-platform:latest
+    pull_policy: never
+    command: scripts/start/beat.sh
+    env_file:
+      - .env                       #CHANGED
+    environment:
+      - DB_HOST=db
+      - REDIS_HOST=redis
+    depends_on:
+      - redis
+      - db
+      - app
+    restart: unless-stopped
+
+  flower:
+    image: open-wearables-platform:latest
+    pull_policy: never
+    command: scripts/start/flower.sh
+    env_file:
+      - .env                       #CHANGED
+    environment:
+      - DB_HOST=db
+      - REDIS_HOST=redis
+    expose:
+      - "5555"                     #CHANGED (give it a Domain too if you want it public)
+    depends_on:
+      - redis
+      - db
+      - app
+    restart: unless-stopped
+
+  redis:
+    image: redis:8
+    volumes:
+      - redis_data:/var/lib/redis/data
+    restart: unless-stopped
+    # ports removed — internal only.                                       #REMOVED
+
+  svix-server:
+    image: svix/svix-server:v1
+    entrypoint:
+      - sh
+      - -c
+      - |
+        : "$${SVIX_JWT_SECRET:=$$SECRET_KEY}"
+        export SVIX_JWT_SECRET
+        exec svix-server "$$@"
+      - --
+    command: ["--run-migrations"]
+    env_file:
+      - .env                       #CHANGED
+    environment:
+      SVIX_DB_DSN: "postgresql://${DB_USER:-open-wearables}:${DB_PASSWORD:-open-wearables}@${DB_HOST:-db}:${DB_PORT:-5432}/svix"
+      SVIX_QUEUE_TYPE: "redis"
+      SVIX_REDIS_DSN: "redis://redis:6379/1"
+      SVIX_CACHE_TYPE: "redis"
+    expose:
+      - "8071"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+      app:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "svix-server", "healthcheck", "http://localhost:8071"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:?Set VITE_API_URL in your environment}
+    image: open-wearables-frontend:latest
+    pull_policy: never
+    expose:
+      - "3000"                     #CHANGED (was ports: 3000:3000 — Traefik routes this)
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
